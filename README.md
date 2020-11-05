@@ -5,7 +5,7 @@ Data and code used for:
 
 Authors: Ruiyun Li, C. Jessica E. Metcalf, Nils Chr. Stenseth, Ottar N. Bjornstad
 
-</b >
+<br >
 **Code used in this study is presented in the R Markdown file.**
 
 **Dataset includes:**
