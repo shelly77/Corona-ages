@@ -5,7 +5,7 @@ Data and code used for:
 
 Authors: Ruiyun Li, C. Jessica E. Metcalf, Nils Chr. Stenseth, Ottar N. Bjornstad
 
-<br >
+<br />
 **Code used in this study is presented in the R Markdown file.**
 
 **Dataset includes:**
@@ -16,5 +16,5 @@ Authors: Ruiyun Li, C. Jessica E. Metcalf, Nils Chr. Stenseth, Ottar N. Bjornsta
 
 (3) *R0 and mobility*: Daily transmissibility and reduced mobility in China
 
-</b >
+<br />
 Questions should be addressed to Dr. Ruiyun Li (ruiyunli1991@gmail.com)
