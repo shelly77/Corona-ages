@@ -1,0 +1,843 @@
+---
+title: "Age-structured SIRS models"
+author: "Ruiyun Li"
+date: "10 October 2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+This is a R Markdown document attached to **A general model for the demographic signatures of the transition from emergence to endemicity**. authors: Ruiyun Li, C. Jessica E. Metcalf, Nils Chr. Stenseth, Ottar N Bjornstad
+
+In this document, we will use a RAS model that integrates realistic age-structure of both demography and social mixing and immunity to establish the suite of possible scenarios of *future age-incidence* and *burden of mortality* from COVID-19.
+
+## Preparation
+
+We will first make some preliminary analyses and data procesing, including
+
+* Annualizing age pyramid
+* Annualizing age-specific # of contacts
+* Calculating baseline estimate of R0
+
+The model assumes a life-expectancy of 80 yrs, and involves 80 age groups. We define two functions to annualize the demographies and social mixing patterns:
+
+```{r}
+
+## Annualize demography
+PageAnn = function(P_age)
+{
+  cumu_P_age_sp <- spline(cumsum(P_age), xout=1:16) # Annualized
+  cumu_P_age_pred = spline(cumu_P_age_sp$y, xout=seq(0,16,1/5)) # predict
+  P_age_pred = diff(cumu_P_age_pred$y)
+  
+  return(P_age_pred)
+}
+
+## Annualize contact matrices
+ContAnn = function(C)
+{
+  n = 16 # 5yr age bracket
+  x=y=(1:n)*5
+  Csym <- (C + t(C))/2 # Symmetrized
+  Csym_vec <- as.vector(unlist(Csym))
+  Csym_df <- data.frame(x = rep(x[1:n], n), y = rep(y[1:n], each = n))
+  Csym_sm = Tps(Csym_df, Csym_vec, df = 100)
+  
+  n = max(x) # 1yr age bracket
+  Csym_ps = predict(Csym_sm, x=expand.grid(1:n, 1:n)) # Annualized
+  Csym_ps2 = matrix(Csym_ps, ncol=n)
+  W = Csym_ps2/mean(Csym_ps2) # normalize
+  
+  return(W)
+}
+
+```
+
+and two functions for the visualization of the annualized datasets:
+
+```{r}
+
+## plot annualized demography ##
+plotDemo = function(P_age_pred, countryname)
+{
+  barplot(P_age_pred*100, ylim=c(0,2), beside = FALSE, border="white",
+          space=0,tck=-.01,ylab="Proportion (%)",font=2,font.axis=2,font.lab=2,cex.lab=1.3,cex.axis=1.2)
+  title(countryname)
+  axis(1,at=c(1,20,40,60,80)-.5,c("0-1","19-20","39-40","59-60","79-80"),las=1,tck=-.01,font=2,cex=1.2)
+}
+
+## plot annualized  matrix ##
+plotCont = function(W, countryname)
+{
+  n = 80
+  image(1:n, 1:n, as.matrix(W), xlab="Age", ylab="Age", breaks=seq(0,max(unlist(W)),length.out=41), 
+        col=grey(seq(1,0,length.out=40)), bty='n',xaxt='n',yaxt='n',font.lab=2,cex.lab=1.3)
+  title(countryname)
+  axis(1, at=c(0,20,40,60,80), c("0","20","40","60","80"), tck=-.01, font=2)
+  axis(2, at=c(0,20,40,60,80), c("0","20","40","60","80"), tck=-.01, font=2)
+}
+
+
+```
+
+We now annualize and plot demography and contact matrix in China:
+
+```{r message = FALSE, warning = FALSE}
+require("fields")
+wd <- getwd()
+Cont_path <- file.path(wd, "Data", "Contact_matrices")
+Demo_path <- file.path(wd,"Data","Demography")
+
+C_CN <- read.csv(paste0(Cont_path,"/", "Extract_CHINA_ALL_Contacts.csv"), header = TRUE)
+P_age_CN <- read.csv(paste0(Demo_path, "/", "Pop_age_prop_CHINA.csv"), header = TRUE)[,3]
+
+W_CN = ContAnn(C_CN); P_age_CN_pred = PageAnn(P_age_CN)
+
+plotCont(W_CN, "")
+plotDemo(P_age_CN_pred, "")
+
+```
+
+We then regress time-varying transmissibility and reduced mobility in China to estimate R0.
+
+```{r message = FALSE, warning = FALSE}
+library(mgcv)
+R0_path <- file.path(wd, "Data", "R0")
+RtMob <- read.csv(paste0(R0_path,"/", "Rt_Mob.csv"), header = TRUE)[15:51,] # 2020-Jan-15: 2020-Feb-20
+
+glm.RtMob <- glm(Rt ~ Mob, family=nb(link=log), data=RtMob)
+
+R0 <- exp(as.numeric(glm.RtMob$coefficients[1]))
+round(R0,2)
+
+```
+
+## Model Framework
+
+The model involves loss of immunity following natural infection. We define:
+
+* S1 - Susceptble
+* I1 - Infected (primary infections)
+* R  - Recovered and transiently immune
+* S2 - Lost immunity and become resusceptble
+* I2 - Reinfected (non-primary infections)
+* K1 - Flux into I1
+* K2 - Flux into I2
+
+- *R0* - Reproduction number
+- 1/$\gamma$ - Average duration of infection
+- $\omega$ - Rate of loss of infection
+- $\nu$ - Birth rate
+- $\mu$ - Death rate
+- *a* - Averge rate of aging
+- *C* - Normalized contact matrix
+- n   - Number of age groups
+
+
+```{r}
+s1s2i1i2rages= function(t, x, params){
+  n=length(params$a)
+  S1 = x[1:n]
+  I1 = x[(n+1):(2*n)]
+  R  = x[(2*n+1):(3*n)]
+  S2 = x[(3*n+1):(4*n)]
+  I2 = x[(4*n+1):(5*n)]
+  
+  K1 = x[(5*n+1):(6*n)]
+  K2 = x[(6*n+1):(7*n)]
+  
+  with(as.list(params), {
+    
+    WI = as.matrix(C)%*%(I1 + I2)
+    
+    phi = R0*(gamma+mu) *WI/N
+    
+    dS1 = c(nu,rep(0,n-1))*N + c(0,a[1:(n-1)]*S1[1:(n-1)]) -
+      phi*S1 - a*S1 - mu*S1                                                                         
+    dI1 = phi*S1 + c(0,a[1:(n-1)]*I1[1:(n-1)]) -
+      gamma*I1 - a*I1 - mu*I1
+    dR = c(0,a[1:(n-1)]*R[1:(n-1)]) + gamma*(I1+I2) -
+      a*R - omega*R - mu*R
+    dS2 = omega*R + c(0,a[1:(n-1)]*S2[1:(n-1)]) -
+      phi*S2 - a*S2 - mu*S2
+    dI2 = phi*S2 + c(0,a[1:(n-1)]*I2[1:(n-1)]) -
+      gamma*I2 - a*I2 - mu*I2
+    
+    dK1 = phi*S1
+    dK2 = phi*S2
+    
+    res = c(dS1, dI1, dR, dS2, dI2, dK1, dK2)
+    list((res))
+  })
+}
+
+```
+
+
+Model is initialized with 1% infections and 0.1% recovered individuals. We will simulate the model with four immunity durations:
+
+* short-lived (3 mos)
+* 1-year
+* 10-year
+* permanent
+
+We define function for simulation:
+
+```{r}
+
+s1s2i1i2ragesim = function(Pages, W)
+{
+  pars1 = list(N = 1, gamma = 365/14, nu = 1/max(x), mu = 0, R0 = R0,
+                     omega=365/90, a = a, P_age = Pages, C = W) # 3-mos duration of immunity
+  pars2 = pars1; pars2$omega = 365/365                          # 1-yr 
+  pars3 = pars1; pars3$omega = 365/(365*10)                     # 10-yr
+  pars4 = pars1; pars4$omega = 0                                # permanent
+  
+  ystart = c(S1 = .989*Pages, I1 = .01*Pages, R = .001*Pages, 
+             S2 = .00*Pages, I2 = .00*Pages, K1 = .00*Pages, K2 = .00*Pages)
+  
+  out1 = as.data.frame(ode(ystart, times=times, func = s1s2i1i2rages, parms = pars1))
+  out2 = as.data.frame(ode(ystart, times=times, func = s1s2i1i2rages, parms = pars2))
+  out3 = as.data.frame(ode(ystart, times=times, func = s1s2i1i2rages, parms = pars3))
+  out4 = as.data.frame(ode(ystart, times=times, func = s1s2i1i2rages, parms = pars4))
+  
+  return(list(out1 = out1, out2 = out2, out3 = out3, out4 = out4))
+
+}
+
+```
+
+For simplicity, model is initially parameterized with rectangular demography and homogeneous social mixing pattern. 
+
+We now simulate the model for 20 years:
+
+```{r message = FALSE, warning = FALSE}
+
+library(deSolve)
+n = 80
+x = 1:n
+a = rep(1,80)
+R0 = 2.3
+Pages0 = rep(1/n,n)             # rectangular demography
+W0 = matrix(1, nrow=n, ncol=n)  # homogeneous mixing
+times = seq(0, 20, by=1/365)
+
+out0 = s1s2i1i2ragesim(Pages0, W0)
+
+```
+
+
+## Age-profile of the risk
+
+With the above simulation, we now predict how the infection unfolds over time and how the risk of infection vary with age during emergence (the 1st year *t1*), medium-term (the 10th year *t2*) and steady-state (the 20th year *t3*). We estimate the risk from all (both primary and non-primary) infections, and that from primary infections. In the latter case, our logic is that mild reinfections will not affect the burden of the disease and thus will not define the risk.
+
+As shown in the figure below, prevalence is predicted to surge during a virgin epidemic but then recede in a diminishing wave pattern as the spread of the infection unfolds over time.
+
+```{r}
+
+tsInf = function(out)
+{
+  tsInf1 = tsInf2 = tsInf3 = tsInf4 <- c(rep(NA,length(times)))
+  
+  with(out,{
+    
+    tsInf1 = apply(out1[,(n+2):(2*n+1)],1,sum) + apply(out1[,(4*n+2):(5*n+1)],1,sum)
+    tsInf2 = apply(out2[,(n+2):(2*n+1)],1,sum) + apply(out2[,(4*n+2):(5*n+1)],1,sum)
+    tsInf3 = apply(out3[,(n+2):(2*n+1)],1,sum) + apply(out3[,(4*n+2):(5*n+1)],1,sum)
+    tsInf4 = apply(out4[,(n+2):(2*n+1)],1,sum) + apply(out4[,(4*n+2):(5*n+1)],1,sum)
+    
+    return(list(tsInf1 = tsInf1, tsInf2 = tsInf2,
+                tsInf3 = tsInf3, tsInf4 = tsInf4))
+    
+  })
+}
+
+tsInf0 = tsInf(out0)
+
+col = c(col=rgb(189/255,189/255,189/255), rgb(253/255,174/255,107/255), rgb(217/255,72/255,1/255))
+plot(1:length(times), tsInf0$tsInf4, type="l",lwd=5,tck=-.01,ylim=c(0,.26),bty='n',
+     xaxt='n',yaxt='n',xlab=NA,ylab="Infected fraction (%)",font.lab=2,font.axis=2,cex.lab=1.3)
+lines(1:length(times), tsInf0$tsInf1, lwd=5,col=col[1])
+lines(1:length(times), tsInf0$tsInf2, lwd=5,col=col[2])
+lines(1:length(times), tsInf0$tsInf3, lwd=5,col=col[3])
+abline(v=365+1,lty=2); abline(v=10*365+1,lty=2); abline(v=20*365+1,lty=2)
+axis(side = 1, at=c(0,20*365+1), c(NA,NA), tck=-.01)
+axis(side = 1, at=c(365+1,10*365+1,20*365+1), c("Epidemic", "Medium-term","Endemic"), tck=-.01,font.axis=2,cex.axis=1.3)
+axis(side = 2, at=c(0,.13,.26), c("0","13","26"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+```
+
+
+We now define functions to estimate and plot the relative risk among age groups:
+
+```{r}
+
+Riskages = function(out)
+{
+  t1 = 1:365; t2 = (1:365)+9*365; t3 = (1:365)+19*365
+  cmp1= (n+2):(2*n+1); cmp2 = (4*n+2):(5*n+1)
+  
+ with(out,{
+   
+     Y1.t1 = apply((out1[t1,cmp1] + out1[t1,cmp2]),2,sum); Y1.t1 = Y1.t1/sum(Y1.t1)
+     Y2.t1 = apply((out2[t1,cmp1] + out2[t1,cmp2]),2,sum); Y2.t1 = Y2.t1/sum(Y2.t1)
+     Y3.t1 = apply((out3[t1,cmp1] + out3[t1,cmp2]),2,sum); Y3.t1 = Y3.t1/sum(Y3.t1)
+     Y4.t1 = apply((out4[t1,cmp1] + out4[t1,cmp2]),2,sum); Y4.t1 = Y4.t1/sum(Y4.t1)
+     
+     Y1.t2 = apply((out1[t2,cmp1] + out1[t2,cmp2]),2,sum); Y1.t2 = Y1.t2/sum(Y1.t2)
+     Y2.t2 = apply((out2[t2,cmp1] + out2[t2,cmp2]),2,sum); Y2.t2 = Y2.t2/sum(Y2.t2)
+     Y3.t2 = apply((out3[t2,cmp1] + out3[t2,cmp2]),2,sum); Y3.t2 = Y3.t2/sum(Y3.t2)
+     Y4.t2 = apply((out4[t2,cmp1] + out4[t2,cmp2]),2,sum); Y4.t2 = Y4.t2/sum(Y4.t2)
+
+     Y1.t3 = apply((out1[t3,cmp1] + out1[t3,cmp2]),2,sum); Y1.t3 = Y1.t3/sum(Y1.t3)
+     Y2.t3 = apply((out2[t3,cmp1] + out2[t3,cmp2]),2,sum); Y2.t3 = Y2.t3/sum(Y2.t3)
+     Y3.t3 = apply((out3[t3,cmp1] + out3[t3,cmp2]),2,sum); Y3.t3 = Y3.t3/sum(Y3.t3)
+     Y4.t3 = apply((out4[t3,cmp1] + out4[t3,cmp2]),2,sum); Y4.t3 = Y4.t3/sum(Y4.t3)
+     
+    
+     y1.t1 = apply(out1[t1,cmp1],2,sum); y1.t1 = y1.t1/sum(y1.t1)
+     y2.t1 = apply(out2[t1,cmp1],2,sum); y2.t1 = y2.t1/sum(y2.t1)
+     y3.t1 = apply(out3[t1,cmp1],2,sum); y3.t1 = y3.t1/sum(y3.t1)
+     y4.t1 = apply(out4[t1,cmp1],2,sum); y4.t1 = y4.t1/sum(y4.t1)
+    
+     y1.t2 = apply(out1[t2,cmp1],2,sum); y1.t2 = y1.t2/sum(y1.t2)
+     y2.t2 = apply(out2[t2,cmp1],2,sum); y2.t2 = y2.t2/sum(y2.t2)
+     y3.t2 = apply(out3[t2,cmp1],2,sum); y3.t2 = y3.t2/sum(y3.t2)
+     y4.t2 = apply(out4[t2,cmp1],2,sum); y4.t2 = y4.t2/sum(y4.t2)
+ 
+     y1.t3 = apply(out1[t3,cmp1],2,sum); y1.t3 = y1.t3/sum(y1.t3)
+     y2.t3 = apply(out2[t3,cmp1],2,sum); y2.t3 = y2.t3/sum(y2.t3)
+     y3.t3 = apply(out3[t3,cmp1],2,sum); y3.t3 = y3.t3/sum(y3.t3)
+     y4.t3 = apply(out4[t3,cmp1],2,sum); y4.t3 = y4.t3/sum(y4.t3)
+
+  return(list(Y1.t1 = Y1.t1, Y2.t1 = Y2.t1, Y3.t1 = Y3.t1, Y4.t1 = Y4.t1,
+              Y1.t2 = Y1.t2, Y2.t2 = Y2.t2, Y3.t2 = Y3.t2, Y4.t2 = Y4.t2,
+              Y1.t3 = Y1.t3, Y2.t3 = Y2.t3, Y3.t3 = Y3.t3, Y4.t3 = Y4.t3,
+              y1.t1 = y1.t1, y2.t1 = y2.t1, y3.t1 = y3.t1, y4.t1 = y4.t1,
+              y1.t2 = y1.t2, y2.t2 = y2.t2, y3.t2 = y3.t2, y4.t2 = y4.t2,
+              y1.t3 = y1.t3, y2.t3 = y2.t3, y3.t3 = y3.t3, y4.t3 = y4.t3))
+ })
+}
+
+plotRiskages = function(Riskages)
+{
+  par(mfrow=c(2,2),mar=c(3,3,0,2), oma=c(0,4,0,2))
+  
+  with(Riskages,{
+    
+    plot(1:n, Y4.t1, type="o",pch=19,lwd=2,tck=-.01,ylim=c(0,.1),bty='n', xlab=NA,ylab=NA,font.axis=2)
+    points(1:n, Y4.t2, type="o",pch=19,lwd=2,col="cyan3")
+    points(1:n, Y4.t3, type="o",pch=19,lwd=2,col="red")
+    text(x=5, y=.095, "A", font=2, cex=2.2)
+
+    plot(1:n, Y3.t1, type="o",pch=19,lwd=2,tck=-.01,ylim=c(0,.03),bty='n', xlab=NA,ylab=NA,font.axis=2)
+    points(1:n, Y3.t2, type="o",pch=19,lwd=2,col="cyan3")
+    points(1:n, Y3.t3, type="o",pch=19,lwd=2,col="red")
+    text(x=5, y=.029, "B", font=2, cex=2.2)
+
+    plot(1:n, Y2.t1, type="o",pch=19,lwd=2,tck=-.01,ylim=c(0,.03),bty='n', xlab=NA,ylab=NA,font.axis=2)
+    points(1:n, Y2.t2, type="o",pch=19,lwd=2,col="cyan3")
+    points(1:n, Y2.t3, type="o",pch=19,lwd=2,col="red")
+    text(x=5, y=.029, "C", font=2, cex=2.2)
+    
+    plot(1:n, Y1.t1, type="o",pch=19,lwd=2,tck=-.01,ylim=c(0,.03),bty='n', xlab=NA,ylab=NA,font.axis=2)
+    points(1:n, Y1.t2, type="o",pch=19,lwd=2,col="cyan3")
+    points(1:n, Y1.t3,type="o", pch=19,lwd=2,col="red")
+    text(x=5, y=.029, "D", font=2, cex=2.2)
+    
+  })
+    mtext(c("Relative risk"), side=2,font=2,cex=1.2,out=TRUE) 
+}
+
+plotRiskages2 = function(Riskages)
+{
+  par(mar=c(3,3,0,2), oma=c(0,4,0,2))
+  layout(matrix(c(3,4,1,2,1,2,5,6), nrow = 4, ncol = 2, byrow = TRUE))
+  
+  with(Riskages,{
+    
+    plot(1:n, y2.t1*20, type="o",pch=19,lwd=2,tck=-.01,ylim=c(0,.6),bty='n',xlab=NA,ylab=NA,font.axis=2,yaxt='n',mgp=c(3,.4,0))
+    points(1:n, y2.t2, type="o",pch=19,lwd=2,col="cyan3")
+    axis(side = 2, at=c(0,.3,.6), c("0","0.015","0.03"), col="black",tck=-.01,font.axis=2,mgp=c(3,.4,0))
+    axis(side = 2, at=c(0,.3,.6), c("0","0.3","0.6"), col="cyan3",tck=-.01,font.axis=2,line=1.5,mgp=c(3,.4,0))
+    text(x=5, y=.6, "E", font=2, cex=2.2)
+    par(new = T)
+    plot(1:n, y2.t3, type="o",pch=19,lwd=2,tck=-.01,ylim=c(0,.7),col="red",xlab=NA,ylab=NA,xaxt='n',yaxt='n',bty='n')
+    axis(side = 4, at=c(0,.35,.7), c("0","0.35","0.7"), col="red",tck=-.01,font.axis=2,mgp=c(3,.4,0))
+
+    plot(1:n, y1.t1*30, type="o",pch=19,lwd=2,tck=-.01,ylim=c(0,.9),bty='n',xlab=NA,ylab=NA,font.axis=2,yaxt='n',mgp=c(3,.4,0))
+    points(1:n, y1.t2, type="o",pch=19,lwd=2,col="cyan3")
+    axis(side = 2, at=c(0,.45,.9), c("0","0.015","0.03"), col="black",tck=-.01,font.axis=2,mgp=c(3,.4,0))
+    axis(side = 2, at=c(0,.45,.9), c("0","0.45","0.9"), col="cyan3",tck=-.01,font.axis=2,line=1.5,mgp=c(3,.4,0))
+    text(x=5, y=.9, "F", font=2, cex=2.2)
+    par(new = T)
+    plot(1:n, y1.t3, type="o",pch=19,lwd=2,tck=-.01,ylim=c(0,1),col="red",xlab=NA,ylab=NA,xaxt='n',yaxt='n',bty='n')
+    axis(side = 4,at=c(0,.5,1), c("0","0.5","1"), col="red",tck=-.01,font.axis=2,mgp=c(3,.4,0))
+    
+  })
+    mtext(c("Relative risk"), side=2,font=2,cex=1.2,out=TRUE)
+}
+
+```
+
+
+We plot the age-risk curve in China, and there you will see four panels showing the relative risk at three phases:
+
+* initial pandemic (black)
+* medium-term (cyan)
+* endemic (red)
+
+and in the scenario of:
+
+* A - Permanent immunity
+* B - 10-year immunity
+* C - 1-year immunity
+* D - Short-lived immunity
+
+```{r}
+
+Riskages0 = Riskages(out0)
+plotRiskages(Riskages0)
+
+```
+
+During the transition to endemism a scenario of permanent or long-term immunity, the young - who for SARS-CoV-2 suffers a mild burden of disease - will have the highest burden of infection once the disease dynamics moves towards the steady-state, as older individuals are protected from infection by prior infection (Panel **A** and **B**). The possibility of rapid reinfection, and severe outcomes on reinfection would contribute to the continuous transmission and high risk among adults, slightly modulating the age profile of risk (Panel **C** and **D**).
+
+However if, alternatively, disease symptoms on reinfection are mild, the burden of the disease may not be much affected, even if rapid reinfection is possible. If so, the age-profile of primary infections will define the risk over time, shifting the risk to younger individuals as a pandemic strain moves towards endemicity (Panel **E** and **F**):
+
+```{r}
+
+plotRiskages2(Riskages0)
+
+```
+
+Take together, we project a plausible transition in the age-structure of COVID-19 risks once the disease reaches probable seasonal endemism, whether assuming long-lasting or brief protective immunity, and across a range of assumptions of relative severity of primary versus subsequent reinfections.
+
+
+## Projections to other contexts
+
+The above code has provided a conceptual model framework showing transitions in age-profile of the risk. We now contexualize the model in a variety of populations by integrating realistic demographic structure and social mixing patterns. We consider 11 global countries:
+
+* Asia:     China, Japan, South Korea
+* Europe:   Spain, United Kindom, France, Germany, Italy
+* Americas: United States, Brazil
+* Africa:   South Africa
+
+Throughout the following code, we will use Unitied Kingdom, Italy and South Africa as representative countries with approx. rectangular, older and younger population structure. Projections to other countries are similar so we will not go into details here.
+
+We firstly annualize datasets:
+
+```{r}
+
+## Contact matrix ##
+C_UK <- read.csv(paste0(Cont_path, "/", "Extract_UK_ALL_Contacts.csv"), header = TRUE)
+C_IT <- read.csv(paste0(Cont_path, "/", "Extract_ITALY_ALL_Contacts.csv"), header = TRUE)
+C_ZA <- read.csv(paste0(Cont_path, "/", "Extract_SOUTH_AFRICA_ALL_Contacts.csv"), header = TRUE)
+
+## Demography ##
+P_age_UK <- read.csv(paste0(Demo_path, "/", "Pop_age_prop_UK.csv"), header = TRUE)[,3]
+P_age_IT <- read.csv(paste0(Demo_path, "/", "Pop_age_prop_ITALY.csv"), header = TRUE)[,3]
+P_age_ZA <- read.csv(paste0(Demo_path, "/", "Pop_age_prop_SOUTH_AFRICA.csv"), header = TRUE)[,3]
+
+## Annualized ##
+W_UK = ContAnn(C_UK); Pages_UK = PageAnn(P_age_UK)
+W_IT = ContAnn(C_IT); Pages_IT = PageAnn(P_age_IT)
+W_ZA = ContAnn(C_ZA); Pages_ZA = PageAnn(P_age_ZA)
+
+par(mfrow=c(2,3),mar=c(4,4,4,1), oma=c(1,1,0,0)) 
+plotDemo(Pages_UK, "United Kingdom"); plotDemo(Pages_IT, "Italy"); plotDemo(Pages_ZA, "South Africa")
+plotCont(W_UK, "United Kingdom"); plotCont(W_IT, "Italy"); plotCont(W_ZA, "South Africa")
+
+```
+
+
+Next, in the figures below, we show that our model predicts a consistent transition in age-profile of risk, either owing to long-term protection from reinfections or reduction of illness severity across a range of countries with different demographies and social mixing patterns.
+
+```{r}
+## UK ##
+out_UK = s1s2i1i2ragesim(Pages_UK, W_UK)
+Riskages_UK = Riskages(out_UK)
+plotRiskages(Riskages_UK)
+plotRiskages2(Riskages_UK)
+
+```
+```{r}
+## Italy ##
+out_IT = s1s2i1i2ragesim(Pages_IT, W_IT) # Italy
+Riskages_IT = Riskages(out_IT) # Italy
+plotRiskages(Riskages_IT)
+plotRiskages2(Riskages_IT)
+
+```
+```{r}
+## South Africa ##
+out_ZA = s1s2i1i2ragesim(Pages_ZA, W_ZA)
+Riskages_ZA = Riskages(out_ZA)
+plotRiskages(Riskages_ZA)
+plotRiskages2(Riskages_ZA)
+
+```
+
+## Trajectories of deaths
+
+Disease burden is also largely dependent on the number of severe infections. We now assess the evolving burden of mortality. To calculate deaths in age group *i*, we multiply model-simulated number of infections by infection-fatality ratio (IFR) of *i*. We project the burden of mortality under two scenarios: immunity i) may or ii) may not attenuate the illness severity.
+
+We begin with the annualization of IFR*:
+
+*ref. [Verity et al. 2020 Lancet Inf Dis](https://www.thelancet.com/journals/laninf/article/PIIS1473-3099(20)30243-7/fulltext)
+
+```{r}
+
+IFR_Verity <- c(.00161, .00695, .0309, .0844, .161, .595, 1.93, 4.28, 7.80)
+IFR = array(NA, 80)
+
+IFR_sp <- spline(log(IFR_Verity[1:8]), xout=1:8) # log: to keep pos
+IFR_sp_pred = spline(IFR_sp$y, xout=seq(0,8,1/10))
+IFR = exp(IFR_sp_pred$y)[-1]
+
+par(oma=c(1,4,2,2), mar=c(5,2,3,2)+.1) # 800 x 650
+plot(1:8, IFR_Verity[1:8], xlim=c(0,8),ylim=c(0,5),tck=-.01,col=NA,pch=19,xaxt='n',yaxt='n',bty='n',xlab=NA,ylab=NA)
+barplot(IFR_Verity[1:8], beside = FALSE, col="lightgrey",border="white",add=TRUE,space=0,tck=-.01,yaxt='n')
+lines(seq(0,8,1/10)[-1], IFR,col=adjustcolor("darkcyan",.6),lwd=2,type='o',pch=19)
+axis(2, at=c(0,1,2,3,4,5), c("0","1","2","3","4","5"),tck=-.01,font.axis=2,cex.axis=1.1)
+axis(1, at=0:7+.5, c("0-9","10-19","20-29","30-39","40-49","50-59","60-69","70-79"),tck=-.01,font.axis=2,cex.axis=1.1)
+
+```
+
+We define function for populationwide fraction of deaths:
+
+```{r}
+
+tsDeaths = function(out, IFR)
+{
+  tsPriInfages1 = tsPriInfages2 = tsPriInfages3 = tsPriInfages4 =
+    tsallInfages1 = tsallInfages2 = tsallInfages3 = tsallInfages4 =
+    
+  tsPriDages1 = tsPriDages2 = tsPriDages3 = tsPriDages4 =
+    tsallDages1 = tsallDages2 = tsallDages3 = tsallDages4 <- array(NA, dim=c(length(times), 80))
+  
+  cmp1= (n+2):(2*n+1); cmp2 = (4*n+2):(5*n+1)
+  
+  with(out,{
+    
+    tsPriInfages1 = out1[,cmp1]
+    tsPriInfages2 = out2[,cmp1]
+    tsPriInfages3 = out3[,cmp1]
+    tsPriInfages4 = out4[,cmp1]
+    
+    tsallInfages1 = out1[,cmp1] + out1[,cmp2]
+    tsallInfages2 = out2[,cmp1] + out2[,cmp2]
+    tsallInfages3 = out3[,cmp1] + out3[,cmp2]
+    tsallInfages4 = out4[,cmp1] + out4[,cmp2]
+    
+    for(i in 1:80){
+      tsPriDages1[,i] = tsPriInfages1[,i] * IFR[i]
+      tsPriDages2[,i] = tsPriInfages2[,i] * IFR[i]
+      tsPriDages3[,i] = tsPriInfages3[,i] * IFR[i]
+      tsPriDages4[,i] = tsPriInfages4[,i] * IFR[i]
+      
+      tsallDages1[,i] = tsallInfages1[,i] * IFR[i]
+      tsallDages2[,i] = tsallInfages2[,i] * IFR[i]
+      tsallDages3[,i] = tsallInfages3[,i] * IFR[i]
+      tsallDages4[,i] = tsallInfages4[,i] * IFR[i]
+    }
+    
+    tsPriD1 = apply(tsPriDages1, 1, sum)
+    tsPriD2 = apply(tsPriDages2, 1, sum)
+    tsPriD3 = apply(tsPriDages3, 1, sum)
+    tsPriD4 = apply(tsPriDages4, 1, sum)
+    
+    tsallD1 = apply(tsallDages1, 1, sum)
+    tsallD2 = apply(tsallDages2, 1, sum)
+    tsallD3 = apply(tsallDages3, 1, sum)
+    tsallD4 = apply(tsallDages4, 1, sum)
+    
+    return(list(tsPriD1 = tsPriD1, tsPriD2 = tsPriD2,
+                tsPriD3 = tsPriD3, tsPriD4 = tsPriD4,
+                tsallD1 = tsallD1, tsallD2 = tsallD2,
+                tsallD3 = tsallD3, tsallD4 = tsallD4))
+  })
+}
+
+```
+
+With the above defined functions we project trajectories of deaths:
+
+```{r}
+
+tsDeaths_UK = tsDeaths(out_UK, IFR)
+tsDeaths_IT = tsDeaths(out_IT, IFR)
+tsDeaths_ZA = tsDeaths(out_ZA, IFR)
+
+```
+
+We plot trajectories of deaths resulted from primary infections i.e in the scenarios that immunity may attenuate severity:
+
+* A - Permanent immunity
+* B - 10-year immunity
+* C - 1-year immunity
+* D - short-lived immunity
+
+* United Kingdom (black)
+* Italy (blue)
+* South Africa (Orange)
+
+```{r}
+T1 = 365*4+1
+T2 = length(times)
+col_vec = c("black", "deep sky blue", "dark orange")
+
+par(oma=c(1,4,1,2), mar=c(3,3,1,1))
+layout(matrix(c(1,2,2,3,4,4,5,6,6,7,8,8), nrow = 4, ncol = 3, byrow = TRUE))
+plot(1:T1, tsDeaths_IT$tsPriD4[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK$tsPriD4[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA$tsPriD4[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"A",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT$tsPriD4[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.006),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK$tsPriD4[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA$tsPriD4[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.003,.006), c("0","0.003","0.006"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT$tsPriD3[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK$tsPriD3[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA$tsPriD3[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"B",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT$tsPriD3[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.006),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK$tsPriD3[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA$tsPriD3[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.003,.006), c("0","0.003","0.006"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT$tsPriD2[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK$tsPriD2[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA$tsPriD2[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"C",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT$tsPriD2[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.006),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK$tsPriD2[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA$tsPriD2[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.003,.006), c("0","0.003","0.006"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT$tsPriD1[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK$tsPriD1[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA$tsPriD1[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+axis(side = 1, at=c(1,365*2+1,365*4+1), c("0","2","4"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"D",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT$tsPriD1[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.006),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK$tsPriD1[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA$tsPriD1[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.003,.006), c("0","0.003","0.006"), tck=-.01,font.axis=2,cex.axis=1.1)
+axis(side = 1, at=c(365*4+1, 365*10+1,365*20+1), c("4","10","20"), tck=-.01,font.axis=2,cex.axis=1.1)
+mtext(c("Fraction of deaths (%)"), side=2,font=2,cex=1.2,out=TRUE)
+mtext("Years", side=1,font=2,cex=1.2,out=TRUE)
+
+```
+
+Alternatively, we plot trajectories of deaths resulted from all infections i.e in the scenarios that immunity may not attenuate severity:
+
+```{r}
+
+par(oma=c(1,4,1,2), mar=c(3,3,1,1))
+layout(matrix(c(1,2,2,3,4,4,5,6,6,7,8,8), nrow = 4, ncol = 3, byrow = TRUE))
+plot(1:T1, tsDeaths_IT$tsallD4[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK$tsallD4[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA$tsallD4[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"A",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT$tsallD4[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.05),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK$tsallD4[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA$tsallD4[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.025,.05), c("0","0.025","0.05"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT$tsallD3[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK$tsallD3[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA$tsallD3[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"B",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT$tsallD3[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.05),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK$tsallD3[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA$tsallD3[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.025,.05), c("0","0.025","0.05"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT$tsallD2[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK$tsallD2[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA$tsallD2[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"C",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT$tsallD2[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.05),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK$tsallD2[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA$tsallD2[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.025,.05), c("0","0.025","0.05"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT$tsallD1[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK$tsallD1[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA$tsallD1[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+axis(side = 1, at=c(1,365*2+1,365*4+1), c("0","2","4"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"D",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT$tsallD1[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.05),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK$tsallD1[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA$tsallD1[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.025,.05), c("0","0.025","0.05"), tck=-.01,font.axis=2,cex.axis=1.1)
+axis(side = 1, at=c(365*4+1, 365*10+1,365*20+1), c("4","10","20"), tck=-.01,font.axis=2,cex.axis=1.1)
+mtext(c("Fraction of deaths (%)"), side=2,font=2,cex=1.2,out=TRUE)
+mtext("Years", side=1,font=2,cex=1.2,out=TRUE)
+
+```
+
+Milder disease from reinfections would give rise to decreasing mortality due to the reduction of severe cases, while burden of mortality over time may remain unchanging if primary infections do not prevent reinfections and severe disease among the elderly. In this bleakest scenario, excess deaths are due to continual severe reinfections that results from the continuous replenishment of susceptibles via waning of immunity to reinfection.
+
+
+## Additional analyses
+
+We now reflect on the above analyses. Firstly, we have simulated the model by using both real-world demographies and social mixing patterns. What is the relative effect of the two drivers on the burden of mortality? Additionally, we have simulated the model in all countries by using the baseline estimate of R0 that are calibrated to China. How will demographies in other countries influences the estimates of R0?
+
+To attend to the first issue, we now simulate the model using realistic demographies coupled with the assumed homogeneous mixing pattern.
+
+```{r}
+out_UK1 = s1s2i1i2ragesim(Pages_UK, W0)
+out_IT1 = s1s2i1i2ragesim(Pages_IT, W0)
+out_ZA1 = s1s2i1i2ragesim(Pages_ZA, W0)
+
+tsDeaths_UK1 = tsDeaths(out_UK1, IFR)
+tsDeaths_IT1 = tsDeaths(out_IT1, IFR)
+tsDeaths_ZA1 = tsDeaths(out_ZA1, IFR)
+
+```
+The predicted trajectories are broadly consistent with those using realistic demographies and mixing patterns. This indicates that varying demographies is the determinant of the disparities in the burden of mortality among countries.
+
+```{r}
+
+par(oma=c(1,4,1,2), mar=c(3,3,1,1))
+layout(matrix(c(1,2,2,3,4,4,5,6,6,7,8,8), nrow = 4, ncol = 3, byrow = TRUE))
+plot(1:T1, tsDeaths_IT1$tsPriD4[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK1$tsPriD4[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA1$tsPriD4[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"A",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT1$tsPriD4[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.006),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK1$tsPriD4[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA1$tsPriD4[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.003,.006), c("0","0.003","0.006"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT1$tsPriD3[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK1$tsPriD3[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA1$tsPriD3[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"B",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT1$tsPriD3[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.006),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK1$tsPriD3[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA1$tsPriD3[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.003,.006), c("0","0.003","0.006"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT1$tsPriD2[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK1$tsPriD2[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA1$tsPriD2[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"C",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT1$tsPriD2[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.006),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK1$tsPriD2[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA1$tsPriD2[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.003,.006), c("0","0.003","0.006"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT1$tsPriD1[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK1$tsPriD1[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA1$tsPriD1[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+axis(side = 1, at=c(1,365*2+1,365*4+1), c("0","2","4"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"D",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT1$tsPriD1[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.006),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK1$tsPriD1[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA1$tsPriD1[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.003,.006), c("0","0.003","0.006"), tck=-.01,font.axis=2,cex.axis=1.1)
+axis(side = 1, at=c(365*4+1, 365*10+1,365*20+1), c("4","10","20"), tck=-.01,font.axis=2,cex.axis=1.1)
+mtext(c("Fraction of deaths (%)"), side=2,font=2,cex=1.2,out=TRUE)
+mtext("Years", side=1,font=2,cex=1.2,out=TRUE)
+
+```
+
+```{r}
+
+par(oma=c(1,4,1,2), mar=c(3,3,1,1))
+layout(matrix(c(1,2,2,3,4,4,5,6,6,7,8,8), nrow = 4, ncol = 3, byrow = TRUE))
+plot(1:T1, tsDeaths_IT1$tsallD4[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK1$tsallD4[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA1$tsallD4[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"A",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT1$tsallD4[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.05),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK1$tsallD4[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA1$tsallD4[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.025,.05), c("0","0.025","0.05"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT1$tsallD3[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK1$tsallD3[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA1$tsallD3[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"B",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT1$tsallD3[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.05),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK1$tsallD3[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA1$tsallD3[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.025,.05), c("0","0.025","0.05"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT1$tsallD2[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK1$tsallD2[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA1$tsallD2[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"C",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT1$tsallD2[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.05),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK1$tsallD2[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA1$tsallD2[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.025,.05), c("0","0.025","0.05"), tck=-.01,font.axis=2,cex.axis=1.1)
+
+plot(1:T1, tsDeaths_IT1$tsallD1[1:T1], type="l",lwd=3,tck=-.01,ylim=c(0,.1),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(1:T1, tsDeaths_UK1$tsallD1[1:T1], col=col_vec[2],lwd=3)
+lines(1:T1, tsDeaths_ZA1$tsallD1[1:T1], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.05,.1), c("0","0.05","0.1"), tck=-.01,font.axis=2,cex.axis=1.1)
+axis(side = 1, at=c(1,365*2+1,365*4+1), c("0","2","4"), tck=-.01,font.axis=2,cex.axis=1.1)
+text(x=250,y=.09,"D",font=2,cex=2.2)
+plot(T1:T2, tsDeaths_IT1$tsallD1[T1:T2], type="l",lwd=3,tck=-.01,ylim=c(0,.06),bty='n', xaxt='n',yaxt='n',xlab=NA,ylab=NA,font.axis=2)
+lines(T1:T2, tsDeaths_UK1$tsallD1[T1:T2], col=col_vec[2],lwd=3)
+lines(T1:T2, tsDeaths_ZA1$tsallD1[T1:T2], col=col_vec[3],lwd=3)
+axis(side = 2, at=c(0,.03,.06), c("0","0.03","0.06"), tck=-.01,font.axis=2,cex.axis=1.1)
+axis(side = 1, at=c(365*4+1, 365*10+1,365*20+1), c("4","10","20"), tck=-.01,font.axis=2,cex.axis=1.1)
+mtext(c("Fraction of deaths (%)"), side=2,font=2,cex=1.2,out=TRUE)
+mtext("Years", side=1,font=2,cex=1.2,out=TRUE)
+
+```
+
+We then examine how demographies may influence the estimates of R0. We assume an exponential growth of the epidemic and so of the incidence during the first 14 days, when susceptible depletion may be sufficiently neglectable. Therefore, each infected individual is expected to give rise to R0 secondary cases and one removal in a serial interval. We regress the model-simulated cumulative incidence over time on the log scale and estimate the rate of exponential growth **r** in each country. We define the association between R0 and **r** as **R0** = **V** x **r** + 1, where **V** is the serial interval (5.1 days).
+
+We define function for the calculation of **r**:
+
+```{r}
+
+exprate = function(out, t_endexp)
+{
+  with(out,{
+    cumuInc = apply(out4[(5*n+1):(7*n)],1,sum) # Cumulative incidence
+    
+    days = 2:t_endexp
+    rate = as.numeric(coef(lm(log(cumuInc[2:t_endexp]) ~ days))[2])
+    return(rate)
+  })
+}
+
+```
+
+We estimate **r** and R0 in the three countries:
+
+```{r}
+exprate_UK = exprate(out_UK,15)
+exprate_IT = exprate(out_IT,15)
+exprate_ZA = exprate(out_ZA,15)
+
+exprate_UK *5.1 + 1
+exprate_IT *5.1 + 1
+exprate_ZA *5.1 + 1
+
+```
+
+Repeating the above estimates in all countries, we will have the estimate of R0 in the 2.1-2.5 range.
