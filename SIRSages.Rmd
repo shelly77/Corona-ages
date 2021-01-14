@@ -22,7 +22,7 @@ We will first make some preliminary analyses and data procesing, including
 The model assumes a life-expectancy of 80 yrs, and involves 80 age groups. We define two functions to annualize the demographies and social mixing patterns:
 
 ```{r}
-
+require("fileds")
 ## Annualize demography
 PageAnn = function(P_age)
 {
@@ -85,13 +85,14 @@ We now annualize and plot demography and contact matrix in China:
 ```{r message = FALSE, warning = FALSE}
 require("fields")
 wd <- getwd()
-Cont_path <- file.path(wd, "Data", "Contact_matrices")
-Demo_path <- file.path(wd,"Data","Demography")
+#Cont_path <- file.path(wd, "Data", "Contact_matrices")
+#Demo_path <- file.path(wd,"Data","Demography")
 
-C_CN <- read.csv(paste0(Cont_path,"/", "Extract_CHINA_ALL_Contacts.csv"), header = TRUE)
-P_age_CN <- read.csv(paste0(Demo_path, "/", "Pop_age_prop_CHINA.csv"), header = TRUE)[,3]
+C_CN <- read.csv("Data/Contact_matrices/Extract_CHINA_ALL_Contacts.csv", header = TRUE)
+P_age_CN <- read.csv("Data/Demography/Pop_age_prop_CHINA.csv", header = TRUE)[,3]
 
-W_CN = ContAnn(C_CN); P_age_CN_pred = PageAnn(P_age_CN)
+W_CN = ContAnn(C_CN); 
+P_age_CN_pred = PageAnn(P_age_CN)
 
 plotCont(W_CN, "")
 plotDemo(P_age_CN_pred, "")
@@ -103,9 +104,10 @@ We then regress time-varying transmissibility and reduced mobility in China to e
 ```{r message = FALSE, warning = FALSE}
 library(mgcv)
 R0_path <- file.path(wd, "Data", "R0")
-RtMob <- read.csv(paste0(R0_path,"/", "Rt_Mob.csv"), header = TRUE)[15:51,] # 2020-Jan-15: 2020-Feb-20
-
-glm.RtMob <- glm(Rt ~ Mob, family=nb(link=log), data=RtMob)
+#RtMob <- read.csv(paste0(R0_path,"/", "Rt_Mob.csv"), header = TRUE)[15:51,] # 2020-Jan-15: 2020-Feb-20
+RtMob <- read.csv("Data/R0/Rt_Mob.csv", header = TRUE)[15:51,] # 
+#gam not glm!
+glm.RtMob <- gam(Rt ~ Mob, family=nb(link=log), data=RtMob)
 
 R0 <- exp(as.numeric(glm.RtMob$coefficients[1]))
 round(R0,2)
@@ -149,7 +151,7 @@ s1s2i1i2rages= function(t, x, params){
   with(as.list(params), {
     
     WI = as.matrix(C)%*%(I1 + I2)
-    
+  ############# or /P_age?????
     phi = R0*(gamma+mu) *WI/N
     
     dS1 = c(nu,rep(0,n-1))*N + c(0,a[1:(n-1)]*S1[1:(n-1)]) -
